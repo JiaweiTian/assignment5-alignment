@@ -200,6 +200,11 @@ def main(args):
     model_name = "Qwen/Qwen2.5-Math-1.5B"
 
     wandb.init(project="gsm8k-sft-experiment", name=args.run_name)
+    wandb.define_metric("train_step")
+    wandb.define_metric("eval_step")
+    wandb.define_metric("train/*", step_metric="train_step")
+    wandb.define_metric("eval/*", step_metric="eval_step")
+
 
     ##################################################
     # get the model and tokenizer
@@ -258,6 +263,7 @@ def main(args):
     model.train()
     tokens_seen = 0
 
+    train_step = 0
     for epoch in range(args.num_epochs):
         # record information
         total_loss = 0
@@ -267,9 +273,17 @@ def main(args):
             labels = labels.to(device)
             response_mask = response_mask.to(device)
 
-            log_probs = get_response_log_probs(model, input_ids, labels, False)
-            loss, _ = sft_microbatch_train_step(log_probs['log_probs'], response_mask, args.gradient_accumulation_steps, 1.0)
+            # feed_forward + loss calculation
+            log_probs_dict = get_response_log_probs(model, input_ids, labels, True)
+            log_probs = log_probs_dict['log_probs']
+            token_entropy = log_probs_dict['token_entropy']
+
+            # minibatch train step
+            loss, _ = sft_microbatch_train_step(log_probs, response_mask, args.gradient_accumulation_steps, 1.0)
             total_loss += loss.item() * args.gradient_accumulation_steps
+
+            wandb.log({"train/loss": loss.item() * args.gradient_accumulation_steps, "train/entropy": token_entropy.mean().item(), "train_step": train_step})
+            train_step += 1
 
             # # update counters and remember the most recent training loss
             tokens_seen += torch.sum(response_mask).item()
@@ -284,7 +298,8 @@ def main(args):
                 optimizer.zero_grad()
 
         avg_loss = total_loss / len(dataloader)
-        print(f"training loss: {avg_loss:.3f}")
+        print(f"epoch: {epoch}, training loss: {avg_loss:.3f}")
+
         
         print("evaluation:")
         with torch.no_grad():
@@ -297,28 +312,26 @@ def main(args):
             #     if isinstance(key, int):
             #         if int(values['rewards']['answer_reward']) == 1
 
-            print(f'Validation results')
+            print('###########################################################')
+            print(f'Epoch {epoch}, Validation results')
             print(f"Number of different format and answer rewards is {results['eval_metrics_nums']}")
             print(f"Ratio of different format and answer rewards is {results['eval_metrics_ratios']}")
             print(f"Accuracy metrics is {results['accuracy']}")
 
             wandb.log({
-                'total_seen_tokens': tokens_seen,
-                'epoch': epoch + 1,
-                'train/loss': avg_loss,
-                'eval/loss': eval_loss,
+                'eval/total_seen_tokens': tokens_seen,
+                'eval/training_avg_loss': avg_loss,
                 'eval/rewards': results['eval_metrics_nums'],
                 'eval/reward_ratios': results['eval_metrics_ratios'],
-                'eval/accuracy': results['accuracy']
+                'eval/accuracy': results['accuracy'],
+                'eval_step': epoch
                 })
-
 
             save_dir = Path(args.output_dir) / f"checkpoint-epoch{epoch+1}"
             save_dir.mkdir(parents=True, exist_ok=True)
             model.save_pretrained(save_dir)
             tokenizer.save_pretrained(save_dir)
             print(f"Saved checkpoint to {save_dir}")
-
 
     print('Finished')
     wandb.finish()

@@ -115,3 +115,130 @@ def math_baseline():
 
 if __name__ == "__main__":
     math_baseline()
+
+
+
+
+
+# import torch
+# import wandb
+# from transformers import AutoModelForCausalLM, AutoTokenizer, AdamW
+# from vllm import LLM, SamplingParams
+# from vllm.model_executor import set_random_seed as vllm_set_random_seed
+# from torch.nn.utils import clip_grad_norm_
+# import json
+# from pathlib import Path
+# from torch.utils.data import DataLoader, Subset
+# # 导入你实现的 helper 函数：tokenize_prompt_and_output, get_response_log_probs, masked_normalize, sft_microbatch_train_step, log_generations, evaluate_vllm 等
+
+# # Starter code from document
+# def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85):
+#     vllm_set_random_seed(seed)
+#     # Monkeypatch (from document)
+#     from unittest.mock import patch
+#     world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
+#     profiling_patch = patch("vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling", return_value=None)
+#     with world_size_patch, profiling_patch:
+#         return LLM(model=model_id, device=device, dtype=torch.bfloat16, enable_prefix_caching=True, gpu_memory_utilization=gpu_memory_utilization)
+
+# def load_policy_into_vllm_instance(policy, llm):
+#     state_dict = policy.state_dict()
+#     llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+#     llm_model.load_weights(state_dict.items())
+
+# # 数据集类
+# class SFTDataset(torch.utils.data.Dataset):
+#     def __init__(self, data_path):
+#         self.data = []
+#         with open(data_path, 'r') as f:
+#             for line in f:
+#                 self.data.append(json.loads(line))
+
+#     def __len__(self):
+#         return len(self.data)
+
+#     def __getitem__(self, idx):
+#         return self.data[idx]['prompt'], self.data[idx]['response']
+
+# # 过滤正确样本 (for part 2)
+# def filter_correct_examples(dataset, reward_fn):
+#     filtered = []
+#     for prompt, response in dataset:
+#         eval_result = reward_fn(prompt + response, ground_truth)  # 假设有 ground_truth，或从数据提取
+#         if eval_result['answer_reward'] == 1:
+#             filtered.append((prompt, response))
+#     return filtered
+
+# # 主训练函数
+# def run_sft(dataset_size, filtered=False, lr=1e-5, batch_size=8, epochs=3, gradient_accumulation_steps=4, seed=42):
+#     wandb.init(project="cs336_sft")
+#     wandb.define_metric("train_step")
+#     wandb.define_metric("eval_step")
+#     wandb.define_metric("train/*", step_metric="train_step")
+#     wandb.define_metric("eval/*", step_metric="eval_step")
+
+#     # 加载模型和 tokenizer
+#     model_path = "/data/a5-alignment/models/Qwen2.5-Math-1.5B"
+#     policy = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2").to('cuda:0')
+#     tokenizer = AutoTokenizer.from_pretrained(model_path)
+#     optimizer = AdamW(policy.parameters(), lr=lr)
+
+#     # 初始化 vLLM (on cuda:1)
+#     vllm = init_vllm(model_path, device='cuda:1', seed=seed)
+
+#     # 加载数据
+#     full_dataset = SFTDataset("/data/a5-alignment/MATH/sft.jsonl")
+#     if filtered:
+#         dataset = filter_correct_examples(full_dataset, reward_fn=cs336_alignment.drgrpo_grader.r1_zero_reward_fn)  # 使用文档中的 reward_fn
+#         print(f"Filtered dataset size: {len(dataset)}")
+#     else:
+#         indices = list(range(min(dataset_size, len(full_dataset))))
+#         dataset = Subset(full_dataset, indices)
+    
+#     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+#     train_step = 0
+#     for epoch in range(epochs):
+#         policy.train()
+#         for batch_idx, (prompts, responses) in enumerate(dataloader):
+#             # Tokenize
+#             tokenized = tokenize_prompt_and_output(prompts, responses, tokenizer)
+#             input_ids = tokenized['input_ids'].to('cuda:0')
+#             labels = tokenized['labels'].to('cuda:0')
+#             response_mask = tokenized['response_mask'].to('cuda:0')
+
+#             # 前向 + log probs
+#             log_probs_dict = get_response_log_probs(policy, input_ids, labels, return_token_entropy=True)
+#             policy_log_probs = log_probs_dict['log_probs']
+#             token_entropy = log_probs_dict['token_entropy']
+
+#             # Microbatch train step
+#             loss, metadata = sft_microbatch_train_step(policy_log_probs, response_mask, gradient_accumulation_steps)
+#             wandb.log({"train/loss": loss.item(), "train/entropy": token_entropy.mean().item()}, step=train_step)
+            
+#             if (batch_idx + 1) % gradient_accumulation_steps == 0:
+#                 clip_grad_norm_(policy.parameters(), 1.0)  # 梯度裁剪
+#                 optimizer.step()
+#                 optimizer.zero_grad()
+#                 train_step += 1
+
+#         # 定期评估
+#         if epoch % 1 == 0:  # 每 epoch 评估一次
+#             load_policy_into_vllm_instance(policy, vllm)
+#             eval_metrics = evaluate_vllm(vllm, reward_fn=cs336_alignment.drgrpo_grader.r1_zero_reward_fn, prompts=val_prompts, eval_sampling_params=SamplingParams(...))
+#             wandb.log({"eval/accuracy": eval_metrics['accuracy']}, step=eval_step)
+#             log_generations(...)  # 日志生成样本
+#             eval_step += 1
+
+#     # 保存模型
+#     policy.save_pretrained(output_dir)
+#     tokenizer.save_pretrained(output_dir)
+
+# # 主入口
+# if __name__ == "__main__":
+#     # 对于部分 1：循环不同 dataset_size
+#     for size in [128, 256, 512, 1024, 'full']:
+#         run_sft(dataset_size=size if size != 'full' else None, filtered=False)
+    
+#     # 对于部分 2：过滤模式
+#     run_sft(dataset_size=None, filtered=True)
