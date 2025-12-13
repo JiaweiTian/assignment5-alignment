@@ -1,8 +1,10 @@
 from vllm import LLM, SamplingParams
-from drgrpo_grader import r1_zero_reward_fn
 from datasets import load_dataset
 import os
 import json
+import re
+
+from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
@@ -10,23 +12,54 @@ os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 # Model and file path
 #########################################################
 model_name = "Qwen/Qwen2.5-Math-1.5B"
-serialize_path = '/Users/jiawei/Desktop/cs336/assignment5-alignment/cs336_alignment/evaluate_results.json'
 
 #########################################################
 # function
 #########################################################
-def load_cot_prompt(question):
+def parse_gsm8k(answer_text):
+    match = re.search(r"####\s*(.+?)(?:\s*$)", answer_text, re.MULTILINE)
+    
+    if match:
+        final_answer = match.group(1).strip()
+        reasoning = answer_text[:match.start()].strip()
+    else:
+        lines = answer_text.splitlines()
+        final_answer = lines[-1].strip()
+        reasoning = "\n".join(lines[:-1]).strip()
+    
+    return final_answer, reasoning
+    
+def load_cot_prompt(valid_data):
+    prompts, responses, answers = [], [], []
+
     """读取思维链提示模板"""
-    prompt_template = """A conversation between User and Assistant. The User asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer. The reasoning process is enclosed within <think> </think> and answer is enclosed within <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. User: {question}. Assistant: <think>"""
+    prompt_path = '/home/assignment5-alignment/cs336_alignment/prompts/r1_zero.prompt'
+    with open(prompt_path, "r") as f:
+        prompt_template = f.read()
 
-    return prompt_template.format(question=question)
+    for element in valid_data:
+        prompts.append(prompt_template.format(question=element['question']))
+ 
+        final_answer, reasoning = parse_gsm8k(element['answer'])
+        responses.append(f"<think>{reasoning}</think> <answer>{final_answer}</answer>")
+        answers.append(final_answer)
 
+    return prompts, responses, answers
+
+def load_dataset_from_local(file_path):
+    dataset = []
+    with open(file_path, "r") as f:
+        for line in f:
+            dataset.append(json.loads(line))
+    return dataset
 
 def look_up_dataset():
-    dataset = load_dataset("openai/gsm8k", "main")
+    # dataset = load_dataset("gsm8k", "main")
 
-    train_data = dataset['train']
-    validation_data = dataset['test']
+    # train_data = dataset['train']
+    # validation_data = dataset['test']
+    train_data = load_dataset_from_local('/home/assignment5-alignment/data/gsm8k/train.jsonl')
+    validation_data = load_dataset_from_local('/home/assignment5-alignment/data/gsm8k/test.jsonl')
 
     print(f'len of train_data and validation_data are {len(train_data)} and {len(validation_data)}')
     print(f'Traing data sample: {train_data[0]}')
@@ -36,7 +69,7 @@ def look_up_dataset():
     return train_data, validation_data
 
 
-def evaluate_vllm(vllm_model, reward_fn, prompts, answers, eval_sampling_params, save_results=False):
+def evaluate_vllm(vllm_model, reward_fn, prompts, responses, answers, eval_sampling_params, serialize_path, save_results=False):
     """
     Evaluate a language model on a list of prompts,
     compute evaluation metrics, and serialize results to disk.
@@ -57,6 +90,7 @@ def evaluate_vllm(vllm_model, reward_fn, prompts, answers, eval_sampling_params,
         temp = {}
         temp['example'] = prompt
         temp['generated_text'] = generated_text
+        temp['gt_response'] = responses[idx]
         temp['answer'] = answers[idx]
         temp['reward'] = reward
         results[idx] = temp
@@ -76,6 +110,8 @@ def evaluate_vllm(vllm_model, reward_fn, prompts, answers, eval_sampling_params,
         accuracy['format_accuracy'] += reward['format_reward'] / num_prompts
         accuracy['answer_accuracy'] += reward['answer_reward'] / num_prompts
 
+        idx += 1
+
     categories_ratios['format_1_answer_1'] = categories['format_1_answer_1'] / num_prompts
     categories_ratios['format_0_answer_0'] = categories['format_0_answer_0'] / num_prompts
     categories_ratios['format_1_answer_0'] = categories['format_1_answer_0'] / num_prompts
@@ -90,14 +126,16 @@ def evaluate_vllm(vllm_model, reward_fn, prompts, answers, eval_sampling_params,
             json.dump(results, f, ensure_ascii=False, indent=4)
         print(f"Save evaluate results to {serialize_path}")
 
-    print('categories is {categories}')
-    print('categories_ratios is {categories_ratios}')
-    print('accuracy is {accuracy}')
+    print(f'categories is {categories}')
+    print(f'categories_ratios is {categories_ratios}')
+    print(f'accuracy is {accuracy}')
 
     return results
 
 
 def math_baseline():
+    serialize_path = '/home/assignment5-alignment/cs336_alignment/evaluate_results_temperature_1203.json'
+
     sampling_params = SamplingParams(temperature=1.0, top_p=1.0, max_tokens=1024)
     sampling_params.stop = ["</answer>"]
     sampling_params.include_stop_str_in_output = True
@@ -106,16 +144,13 @@ def math_baseline():
 
     train_data, valid_data = look_up_dataset()
 
-    prompts = [load_cot_prompt(valid_data[i]['question']) for i in range(len(valid_data))]
-    answers = [valid_data[i]['answer'] for i in range(len(valid_data))]
+    prompts, responses, answers = load_cot_prompt(valid_data)
 
-
-    _ = evaluate_vllm(llm, r1_zero_reward_fn, prompts, answers, sampling_params, True)
+    _ = evaluate_vllm(llm, r1_zero_reward_fn, prompts, responses, answers, sampling_params, serialize_path, True)
 
 
 if __name__ == "__main__":
     math_baseline()
-
 
 
 

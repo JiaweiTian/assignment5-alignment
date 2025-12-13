@@ -2,6 +2,9 @@
 models/
 data/
 .DS_Store
+outputs/
+wandb/
+.vscode/
 
 nav
 tags

@@ -96,9 +96,9 @@ def get_response_log_probs(model, input_ids, labels, return_token_entropy=False)
     results = {}
     results['log_probs'] = log_probs
 
-    # if return_token_entropy:
-    #     entropy = compute_entropy(logits)
-    #     results['token_entropy'] = entropy
+    if return_token_entropy:
+        entropy = compute_entropy(logits)
+        results['token_entropy'] = entropy
 
     return results
 
@@ -177,13 +177,11 @@ def load_model_and_tokenizer(model_name):
 
 
 class SFTDataset(Dataset):
-    def __init__(self, inputs_data, num_samples, tokenizer):
-        self.num_samples = num_samples if num_samples else len(inputs_data)
+    def __init__(self, inputs_data, tokenizer):
+        self.num_samples = len(inputs_data)
 
-        random_idx = random.sample(range(len(inputs_data)), self.num_samples)
-
-        subset_data = [inputs_data[i] for i in random_idx]
-        prompts, responses, _ = load_cot_prompt(subset_data)
+        prompts = [inputs_data[idx]['prompt'] for idx in range(self.num_samples)]
+        responses = [inputs_data[idx]['response'] for idx in range(self.num_samples)]
 
         self.dictionary = tokenize_prompt_and_output(prompts, responses, tokenizer)
     
@@ -197,6 +195,21 @@ class SFTDataset(Dataset):
         
         return input_ids, labels, response_mask
 
+def generate_and_filter_samples(vllm_model, sampling_params, sampling_data):
+    prompts, _, answers = load_cot_prompt(sampling_data)
+
+    generation_outputs = vllm_model.generate(prompts, sampling_params)
+
+    # for every question, every response, if it's reward is 1, then save it for later training
+    filtered_samples = []
+    for i, output in enumerate(generation_outputs):
+        for num in range(len(output.outputs)):
+            generated_text = output.outputs[num].text
+            reward = r1_zero_reward_fn(generated_text, answers[i])
+            if int(reward['reward']) == 1:
+                filtered_samples.append({'prompt': output.prompt, 'response': generated_text})
+    print(f'number of samples in filtered_samples is {len(filtered_samples)}')
+    return filtered_samples
 
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -208,30 +221,20 @@ def main(args):
     wandb.define_metric("train/*", step_metric="train_step")
     wandb.define_metric("eval/*", step_metric="eval_step")
 
-
     ##################################################
     # get the model and tokenizer
     ##################################################
     model, tokenizer = load_model_and_tokenizer(model_name)
     model.to('cuda:0')
 
-    ##################################################
-    # get the training and validation data
-    ##################################################
-    training_data, valid_data = look_up_dataset()
+    #################################################
+    # initilize vllm model for inference
+    #################################################
+    SEED = 42
+    sampling_params = SamplingParams(temperature=1.0, top_p=1.0, max_tokens=1024, min_tokens=4, n=args.G, stop=["</answer>"], include_stop_str_in_output=True)
+    valid_sampling_params = SamplingParams(temperature=1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"], include_stop_str_in_output=True)
+    vllm_model = init_vllm(model_name, device, SEED, gpu_memory_utilization=0.25)
 
-    train_dataset = SFTDataset(training_data, args.num_samples, tokenizer)
-
-    dataloader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True
-    )
-
-    valid_prompts, valid_responses, valid_answers = load_cot_prompt(valid_data)
-    
     #################################################
     # optimizer
     #################################################
@@ -243,97 +246,103 @@ def main(args):
         eps=1e-8
     )
 
-    num_training_steps = len(dataloader) * args.num_epochs // args.gradient_accumulation_steps
-    num_warmup_steps = int(args.warmup_ratio * num_training_steps)
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=num_warmup_steps,
-        num_training_steps=num_training_steps
-    )
+    ##################################################
+    # get the training and validation data
+    ##################################################
+    training_data, valid_data = look_up_dataset()
+    valid_prompts, valid_responses, valid_answers = load_cot_prompt(valid_data)
 
-    #################################################
-    # initilize vllm model for inference
-    #################################################
-    SEED = 42
-    sampling_params = SamplingParams(temperature=1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"], include_stop_str_in_output=True)
-    vllm_model = init_vllm(model_name, device, SEED, gpu_memory_utilization=0.3)
-
-    #################################################
-    # training loop
-    #################################################
-    model.train()
     tokens_seen = 0
-
     train_step = 0
-    for epoch in range(args.num_epochs):
-        # record information
-        total_loss = 0
 
-        for idx, (input_ids, labels, response_mask) in enumerate(dataloader):
-            input_ids = input_ids.to(device)
-            labels = labels.to(device)
-            response_mask = response_mask.to(device)
+    model.train()
+    for ei_step in range(args.n_ei_steps):
+        sampling_data = random.sample(training_data, k = args.num_samples)
 
-            # feed_forward + loss calculation
-            log_probs_dict = get_response_log_probs(model, input_ids, labels, True)
-            log_probs = log_probs_dict['log_probs']
-            # token_entropy = log_probs_dict['token_entropy']
-
-            # minibatch train step
-            loss, _ = sft_microbatch_train_step(log_probs, response_mask, args.gradient_accumulation_steps, 1.0)
-            total_loss += loss.item() * args.gradient_accumulation_steps
-
-            wandb.log({"train/loss": loss.item() * args.gradient_accumulation_steps, "train_step": train_step})
-            train_step += 1
-
-            # # update counters and remember the most recent training loss
-            tokens_seen += torch.sum(response_mask).item()
-
-            if (idx + 1) % (args.gradient_accumulation_steps) == 0:
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                # Update weights every `gradient_accumulation_steps` batches.
-                optimizer.step()
-                scheduler.step()
-                # Zero gradients every `gradient_accumulation_steps` batches.
-                optimizer.zero_grad()
-
-        avg_loss = total_loss / len(dataloader)
-        print(f"epoch: {epoch}, training loss: {avg_loss:.3f}")
-        
-        print("evaluation:")
         with torch.no_grad():
             load_policy_into_vllm_instance(model, vllm_model)
+            reasoing_traces = generate_and_filter_samples(vllm_model, sampling_params, sampling_data)
+            nums = len(reasoing_traces) // (args.batch_size * args.gradient_accumulation_steps)
+            reasoing_traces = reasoing_traces[:nums * (args.batch_size * args.gradient_accumulation_steps)]
 
-            serialize_path = Path(args.output_dir) / f"evaluate_results_epoch{epoch+1}.json"
-            results = evaluate_vllm(vllm_model, r1_zero_reward_fn, valid_prompts, valid_responses, valid_answers, sampling_params, serialize_path, True)
+        train_dataset = SFTDataset(reasoing_traces, tokenizer)
+
+        dataloader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True
+        )
+
+        #################################################
+        # training loop
+        #################################################
+        for epoch in range(args.num_epochs):
+            # record information
+            total_loss = 0
+
+            for idx, (input_ids, labels, response_mask) in enumerate(dataloader):
+                input_ids = input_ids.to(device)
+                labels = labels.to(device)
+                response_mask = response_mask.to(device)
+
+                # feed_forward + loss calculation
+                log_probs_dict = get_response_log_probs(model, input_ids, labels, False)
+                log_probs = log_probs_dict['log_probs']
+                # token_entropy = log_probs_dict['token_entropy']
+
+                # minibatch train step
+                loss, _ = sft_microbatch_train_step(log_probs, response_mask, args.gradient_accumulation_steps, 1.0)
+                total_loss += loss.item() * args.gradient_accumulation_steps
+
+                wandb.log({"train/loss": loss.item() * args.gradient_accumulation_steps, "train_step": train_step})
+                train_step += 1
+
+                # # update counters and remember the most recent training loss
+                tokens_seen += torch.sum(response_mask).item()
+
+                if (idx + 1) % (args.gradient_accumulation_steps) == 0:
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    # Update weights every `gradient_accumulation_steps` batches.
+                    optimizer.step()
+                    # Zero gradients every `gradient_accumulation_steps` batches.
+                    optimizer.zero_grad()
+
+            avg_loss = total_loss / len(dataloader)
+            print(f"epoch: {epoch}, training loss: {avg_loss:.3f}")
             
-            # filted_samples = {}
-            # for key, value in results.items():
-            #     if isinstance(key, int):
-            #         if int(values['rewards']['answer_reward']) == 1
+            print("evaluation:")
+            with torch.no_grad():
+                load_policy_into_vllm_instance(model, vllm_model)
 
-            print('###########################################################')
-            print(f'Epoch {epoch}, Validation results')
-            print(f"Number of different format and answer rewards is {results['eval_metrics_nums']}")
-            print(f"Ratio of different format and answer rewards is {results['eval_metrics_ratios']}")
-            print(f"Accuracy metrics is {results['accuracy']}")
+                path = Path(args.output_dir)
+                path.mkdir(parents=True, exist_ok=True)
+                serialize_path = Path(args.output_dir) / f"evaluate_results_ei_{ei_step}_epoch{epoch}.json"
+                results = evaluate_vllm(vllm_model, r1_zero_reward_fn, valid_prompts, valid_responses, valid_answers, valid_sampling_params, serialize_path, True)
 
-            wandb.log({
-                'eval/total_seen_tokens': tokens_seen,
-                'eval/training_avg_loss': avg_loss,
-                'eval/rewards': results['eval_metrics_nums'],
-                'eval/reward_ratios': results['eval_metrics_ratios'],
-                'eval/accuracy': results['accuracy'],
-                'eval_step': epoch
-                })
+                print('###########################################################')
+                print(f'EI_step: {ei_step}, Epoch {epoch}, Validation results')
+                print(f"Number of different format and answer rewards is {results['eval_metrics_nums']}")
+                print(f"Ratio of different format and answer rewards is {results['eval_metrics_ratios']}")
+                print(f"Accuracy metrics is {results['accuracy']}")
 
-            if epoch == args.num_epochs - 1:
-                save_dir = Path(args.output_dir) / f"checkpoint-epoch{epoch+1}"
-                save_dir.mkdir(parents=True, exist_ok=True)
-                model.save_pretrained(save_dir)
-                tokenizer.save_pretrained(save_dir)
-                print(f"Saved checkpoint to {save_dir}")
+                wandb.log({
+                    'eval/total_seen_tokens': tokens_seen,
+                    'eval/training_avg_loss': avg_loss,
+                    'eval/rewards': results['eval_metrics_nums'],
+                    'eval/reward_ratios': results['eval_metrics_ratios'],
+                    'eval/accuracy': results['accuracy'],
+                    'eval_step': epoch + 1 + ei_step * args.num_epochs
+                    })
+
+                if ei_step == args.n_ei_steps - 1:
+                    save_dir = Path(args.output_dir) / f"checkpoint_last"
+                    save_dir.mkdir(parents=True, exist_ok=True)
+                    model.save_pretrained(save_dir)
+                    tokenizer.save_pretrained(save_dir)
+                    print(f"Saved checkpoint to {save_dir}")
 
     print('Finished')
     wandb.finish()
@@ -349,13 +358,14 @@ def main(args):
 
 def get_training_args():
     parser = argparse.ArgumentParser(description='training codes for supervised finetuning')
-
-    parser.add_argument('--num_epochs', type=int, default=10, help='total number of training epoch')
+    parser.add_argument('--G', type=int, default=2, help='number of samples from the policy model')
+    parser.add_argument('--n_ei_steps', type=int, default=5, help='total number of training epoch')
+    parser.add_argument('--num_epochs', type=int, default=2, help='total number of training epoch')
     parser.add_argument('--num_samples', type=int, default=7472, help='number of unique examples for SFT')
     parser.add_argument('--warmup_ratio', type=float, default=0.1, help='ratios for warmup steps')
     parser.add_argument('--batch_size', type=int, default=2, help='batch_size during training')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=4, help='gradient_accumulation_steps')
-    parser.add_argument("--output_dir", type=str, default="/root/autodl-tmp/outputs/2025_1202_sft/7472samples")
+    parser.add_argument("--output_dir", type=str, default="/root/autodl-tmp/outputs/2025_1205_expert_iteration/7472samples")
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--run_name", type=str, default=(lambda: datetime.now().strftime("%Y-%m%d-%H%M%S"))(), help="Experiment name, default is current timestamp")
     
