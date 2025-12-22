@@ -116,6 +116,7 @@ def sft_microbatch_train_step(policy_log_probs, response_mask, gradient_accumula
     loss = masked_normalize(policy_log_probs, response_mask, normalize_constant, None)
     loss /= batch_size
     loss = -loss / gradient_accumulation_steps
+    print(f'shape of loss is {loss.shape}')
 
     loss.backward()
 
