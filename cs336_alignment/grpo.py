@@ -23,6 +23,8 @@ from cs336_alignment.zero_shot_baseline import (load_cot_prompt,
                                                 )
 from cs336_alignment.expert_iteration import tokenize_prompt_and_output, get_response_log_probs, masked_normalize
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+
 def compute_group_normalized_rewards(reward_fn, rollout_responses, repeated_ground_truths, group_size, advantage_eps, normalize_by_std):
     '''
         Input:
@@ -213,8 +215,7 @@ def load_model_and_tokenizer(model_name):
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-        device_map="auto"
+        attn_implementation="flash_attention_2"
     )
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -285,6 +286,7 @@ def main(args):
     # get the model and tokenizer
     ##################################################
     model, tokenizer = load_model_and_tokenizer(model_name)
+    model.gradient_checkpointing_enable()
     model.to(device)
 
     #################################################
@@ -339,14 +341,18 @@ def main(args):
         for epoch in range(args.epochs_per_rollout_batch):
             # record information
             total_loss = 0
+            total_token_entropy = 0.0
 
-            for idx, (input_ids, labels, response_mask, indices) in enumerate(dataloader):
+            # Add tqdm progress bar here
+            for idx, (input_ids, labels, response_mask, indices) in enumerate(
+                tqdm(dataloader, desc=f"Step: {step}, Epoch: {epoch} Training", leave=False)
+            ):
                 input_ids = input_ids.to(device)
                 labels = labels.to(device)
                 response_mask = response_mask.to(device)
 
                 # feed_forward + loss calculation
-                log_probs_dict = get_response_log_probs(model, input_ids, labels, False)
+                log_probs_dict = get_response_log_probs(model, input_ids, labels, True)
                 policy_log_probs = log_probs_dict['log_probs']
                 token_entropy = log_probs_dict['token_entropy']
                 mean_token_entropy = torch.mean(token_entropy).item()
@@ -361,49 +367,52 @@ def main(args):
                     loss, _ = grpo_microbatch_train_step(policy_log_probs, response_mask, args.gradient_accumulation_steps, args.loss_type, advantages=advantages_batch)    
                 elif args.loss_type == 'grpo_clip':
                     pass
+
                 total_loss += loss.item() * args.gradient_accumulation_steps
+                total_token_entropy += mean_token_entropy
 
-                wandb.log({"train/loss": loss.item() * args.gradient_accumulation_steps, "train/token_entropy": mean_token_entropy, "train_step": train_step})
                 train_step += 1
-
-                # # update counters and remember the most recent training loss
                 tokens_seen += torch.sum(response_mask).item()
 
                 if (idx + 1) % (args.gradient_accumulation_steps) == 0:
                     # Gradient clipping
                     total_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    wandb.log({"train/grad_norm": total_grad_norm, "train_step": train_step})
                     # Update weights every `gradient_accumulation_steps` batches.
                     optimizer.step()
                     # Zero gradients every `gradient_accumulation_steps` batches.
                     optimizer.zero_grad()
 
             avg_loss = total_loss / len(dataloader)
-            print(f"grpo training step: {step}, epoch: {epoch}, total steps: {train_step}, training loss: {avg_loss:.3f}")
-            
-            print("evaluation:")
+            avg_token_entropy = total_token_entropy / len(dataloader)
+            wandb.log({"train/training_avg_loss": avg_loss, "train/training_avg_token_entropy": avg_token_entropy, "train/grad_norm": total_grad_norm, "train_step": train_step})
+            print(f"grpo training step: {step}, epoch: {epoch}, total micro-batch steps: {train_step}, training loss: {avg_loss:.3f}")
+
+        #################################################
+        # evaluation process
+        #################################################
+        print("evaluation:")
+        if step % args.eval_every_n_steps == 0 or step == args.n_grpo_steps - 1:
             with torch.no_grad():
                 load_policy_into_vllm_instance(model, vllm_model)
 
                 path = Path(args.output_dir)
                 path.mkdir(parents=True, exist_ok=True)
-                serialize_path = Path(args.output_dir) / f"evaluate_results_grpo_{step}_epoch{epoch}.json"
+                serialize_path = Path(args.output_dir) / f"evaluate_results_grpo_{step}.json"
                 results = evaluate_vllm(vllm_model, r1_zero_reward_fn, valid_prompts, valid_responses, valid_answers, valid_sampling_params, serialize_path, True)
 
                 print('###########################################################')
-                print(f'grpo evaluation step: {step}, Epoch {epoch}, total steps: {train_step}, Validation results')
+                print(f'grpo evaluation step: {step}, total micro-batch steps: {train_step}, Validation results')
                 print(f"Number of different format and answer rewards is {results['eval_metrics_nums']}")
                 print(f"Ratio of different format and answer rewards is {results['eval_metrics_ratios']}")
                 print(f"Accuracy metrics is {results['accuracy']}")
 
                 wandb.log({
                     'eval/total_seen_tokens': tokens_seen,
-                    'eval/training_avg_loss': avg_loss,
                     'eval/rewards': results['eval_metrics_nums'],
                     'eval/reward_ratios': results['eval_metrics_ratios'],
                     'eval/accuracy': results['accuracy'],
-                    'eval_step': train_step
-                    })
+                    'eval_step': step
+                })
 
                 if step == args.n_grpo_steps - 1:
                     save_dir = Path(args.output_dir) / f"checkpoint_last"
@@ -428,7 +437,7 @@ def get_training_args():
     parser = argparse.ArgumentParser(description='training codes for group relative policy optimization')
 
     parser.add_argument("--n_grpo_steps", type=int, default=200, help="Number of GRPO training steps")
-    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate for the optimizer")
+    parser.add_argument("--learning_rate", type=float, default=1e-6, help="Learning rate for the optimizer")
     parser.add_argument("--advantage_eps", type=float, default=1e-6, help="Epsilon added to std when normalizing advantages")
     parser.add_argument("--rollout_batch_size", type=int, default=256, help="Number of rollouts collected per batch")
     parser.add_argument("--group_size", type=int, default=8, help="Size of each group for group-relative normalization")
@@ -438,18 +447,19 @@ def get_training_args():
     parser.add_argument("--epochs_per_rollout_batch", type=int, default=1, help="Number of training epochs per collected rollout batch (on-policy = 1)")
     parser.add_argument("--train_batch_size", type=int, default=256, help="Training batch size (on-policy)")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=128, help="Number of gradient accumulation steps (microbatching)")
-    parser.add_argument("--gpu_memory_utilization", type=float, default=0.85, help="Target GPU memory utilization for vLLM")
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.6, help="Target GPU memory utilization for vLLM")
     parser.add_argument("--loss_type",
-        type=str,
-        choices=["no_baseline", "reinforce_with_baseline", "grpo_clip"],
-        default="reinforce_with_baseline",
-        help="Type of policy gradient loss to use"
+            type=str,
+            choices=["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+            default="reinforce_with_baseline",
+            help="Type of policy gradient loss to use"
     )
     # Requires Python 3.9+ for BooleanOptionalAction; fallback to store_true/store_false can be used otherwise.
     parser.add_argument("--use_std_normalization", action=argparse.BooleanOptionalAction, default=True, help="Whether to normalize advantages by their standard deviation")
     parser.add_argument("--cliprange", type=float, default=0.2, help="Clipping range for GRPO-clip loss")
-    parser.add_argument("--output_dir", type=str, default="/root/autodl-tmp/outputs/2025_1222_grpo_no_baseline")
+    parser.add_argument("--output_dir", type=str, default="/root/autodl-tmp/outputs/2025_1224_grpo_no_baseline_lr_1e-6")
     parser.add_argument("--run_name", type=str, default=(lambda: datetime.now().strftime("%Y-%m%d-%H%M%S"))(), help="Experiment name, default is current timestamp")
+    parser.add_argument("--eval_every_n_steps", type=int, default=10, help="Evaluate every N steps")
 
     return parser.parse_args()
 

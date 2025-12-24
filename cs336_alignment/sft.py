@@ -96,9 +96,9 @@ def get_response_log_probs(model, input_ids, labels, return_token_entropy=False)
     results = {}
     results['log_probs'] = log_probs
 
-    # if return_token_entropy:
-    #     entropy = compute_entropy(logits)
-    #     results['token_entropy'] = entropy
+    if return_token_entropy:
+        entropy = compute_entropy(logits)
+        results['token_entropy'] = entropy
 
     return results
 
