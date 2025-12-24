@@ -143,7 +143,7 @@ def compute_policy_gradient_loss(policy_log_probs, loss_type, raw_rewards, advan
     
 def masked_mean(tensor: torch.Tensor, mask: torch.Tensor, dim: int | None = None) -> torch.Tensor:
     masked = tensor * mask
-    return masked.sum(dim=dim) / (mask.sum(dim=dim) + 1e-8) # 只除以mask=1的个数， 而不是整个seq_len
+    return masked.sum(dim=dim) / mask.sum(dim=dim) # 只除以mask=1的个数， 而不是整个seq_len
 
 
 def grpo_microbatch_train_step(
@@ -437,7 +437,7 @@ def get_training_args():
     parser = argparse.ArgumentParser(description='training codes for group relative policy optimization')
 
     parser.add_argument("--n_grpo_steps", type=int, default=200, help="Number of GRPO training steps")
-    parser.add_argument("--learning_rate", type=float, default=1e-6, help="Learning rate for the optimizer")
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate for the optimizer")
     parser.add_argument("--advantage_eps", type=float, default=1e-6, help="Epsilon added to std when normalizing advantages")
     parser.add_argument("--rollout_batch_size", type=int, default=256, help="Number of rollouts collected per batch")
     parser.add_argument("--group_size", type=int, default=8, help="Size of each group for group-relative normalization")
@@ -457,7 +457,7 @@ def get_training_args():
     # Requires Python 3.9+ for BooleanOptionalAction; fallback to store_true/store_false can be used otherwise.
     parser.add_argument("--use_std_normalization", action=argparse.BooleanOptionalAction, default=True, help="Whether to normalize advantages by their standard deviation")
     parser.add_argument("--cliprange", type=float, default=0.2, help="Clipping range for GRPO-clip loss")
-    parser.add_argument("--output_dir", type=str, default="/root/autodl-tmp/outputs/2025_1224_grpo_no_baseline_lr_1e-6")
+    parser.add_argument("--output_dir", type=str, default="/root/autodl-tmp/outputs/2025_1224_grpo_no_baseline_lr_1e-4")
     parser.add_argument("--run_name", type=str, default=(lambda: datetime.now().strftime("%Y-%m%d-%H%M%S"))(), help="Experiment name, default is current timestamp")
     parser.add_argument("--eval_every_n_steps", type=int, default=10, help="Evaluate every N steps")
 
