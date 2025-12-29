@@ -262,6 +262,7 @@ def generate_and_filter_samples(vllm_model, sampling_params, sampling_data, grou
     return samples, advantages, raw_rewards, metadata
 
 def main(args):
+    print(args)
     #############################################
     # assertions and derived parameters
     #############################################
@@ -404,6 +405,8 @@ def main(args):
                 print(f'grpo evaluation step: {step}, total micro-batch steps: {train_step}, Validation results')
                 print(f"Number of different format and answer rewards is {results['eval_metrics_nums']}")
                 print(f"Ratio of different format and answer rewards is {results['eval_metrics_ratios']}")
+                print(f'response_token_lens is {results["response_token_lens"]}')
+                print(f'response_char_lens is {results["response_char_lens"]}')
                 print(f"Accuracy metrics is {results['accuracy']}")
 
                 wandb.log({
@@ -411,6 +414,8 @@ def main(args):
                     'eval/rewards': results['eval_metrics_nums'],
                     'eval/reward_ratios': results['eval_metrics_ratios'],
                     'eval/accuracy': results['accuracy'],
+                    'eval/response_token_lens': results['response_token_lens'],
+                    'eval/response_char_lens': results['response_char_lens'],
                     'eval_step': step
                 })
 
@@ -436,8 +441,8 @@ def main(args):
 def get_training_args():
     parser = argparse.ArgumentParser(description='training codes for group relative policy optimization')
 
-    parser.add_argument("--n_grpo_steps", type=int, default=200, help="Number of GRPO training steps")
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate for the optimizer")
+    parser.add_argument("--n_grpo_steps", type=int, default=100, help="Number of GRPO training steps")
+    parser.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate for the optimizer")
     parser.add_argument("--advantage_eps", type=float, default=1e-6, help="Epsilon added to std when normalizing advantages")
     parser.add_argument("--rollout_batch_size", type=int, default=256, help="Number of rollouts collected per batch")
     parser.add_argument("--group_size", type=int, default=8, help="Size of each group for group-relative normalization")
@@ -457,7 +462,7 @@ def get_training_args():
     # Requires Python 3.9+ for BooleanOptionalAction; fallback to store_true/store_false can be used otherwise.
     parser.add_argument("--use_std_normalization", action=argparse.BooleanOptionalAction, default=True, help="Whether to normalize advantages by their standard deviation")
     parser.add_argument("--cliprange", type=float, default=0.2, help="Clipping range for GRPO-clip loss")
-    parser.add_argument("--output_dir", type=str, default="/root/autodl-tmp/outputs/2025_1224_grpo_no_baseline_lr_1e-4")
+    parser.add_argument("--output_dir", type=str, default="/root/autodl-tmp/outputs/2025_1224_grpo_baseline_no_stdev_lr_5e-5")
     parser.add_argument("--run_name", type=str, default=(lambda: datetime.now().strftime("%Y-%m%d-%H%M%S"))(), help="Experiment name, default is current timestamp")
     parser.add_argument("--eval_every_n_steps", type=int, default=10, help="Evaluate every N steps")
 

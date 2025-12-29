@@ -68,6 +68,22 @@ def look_up_dataset():
 
     return train_data, validation_data
 
+def calculate_average(num_prompts, response_lens, categories):
+    sum_lens = 0
+    average_lens = {}
+    for key in categories.keys():
+        if categories[key] > 0:
+            sum_lens += response_lens[key]
+            average_lens[key] = response_lens[key] / categories[key]
+        else:
+            average_lens[key] = 0
+
+    if num_prompts > 0:
+        average_lens['total'] = sum_lens / num_prompts
+    else:
+        average_lens['total'] = 0
+        
+    return average_lens
 
 def evaluate_vllm(vllm_model, reward_fn, prompts, responses, answers, eval_sampling_params, serialize_path, save_results=False):
     """
@@ -75,6 +91,8 @@ def evaluate_vllm(vllm_model, reward_fn, prompts, responses, answers, eval_sampl
     compute evaluation metrics, and serialize results to disk.
     """
     results = {}
+    response_token_lens = {'format_1_answer_1': 0, 'format_1_answer_0': 0, 'format_0_answer_1': 0, 'format_0_answer_0': 0, 'total': 0}
+    response_char_lens = {'format_1_answer_1': 0, 'format_1_answer_0': 0, 'format_0_answer_1': 0, 'format_0_answer_0': 0, 'total': 0}
     categories = {'format_1_answer_1': 0, 'format_1_answer_0': 0, 'format_0_answer_1': 0, 'format_0_answer_0': 0}
     categories_ratios = {'format_1_answer_1': 0, 'format_1_answer_0': 0, 'format_0_answer_1': 0, 'format_0_answer_0': 0}
     accuracy = {'total_accuracy': 0, 'format_accuracy': 0, 'answer_accuracy': 0}
@@ -99,12 +117,20 @@ def evaluate_vllm(vllm_model, reward_fn, prompts, responses, answers, eval_sampl
         answer_reward = int(reward['answer_reward'])
         if format_reward == 1 and answer_reward == 1:
             categories['format_1_answer_1'] += 1
+            response_token_lens['format_1_answer_1'] += len(output.outputs[0].token_ids)
+            response_char_lens['format_1_answer_1'] += len(generated_text)
         elif format_reward == 0 and answer_reward == 1:
             categories['format_0_answer_1'] += 1
+            response_token_lens['format_0_answer_1'] += len(output.outputs[0].token_ids)
+            response_char_lens['format_0_answer_1'] += len(generated_text)
         elif format_reward == 1 and answer_reward == 0:
             categories['format_1_answer_0'] += 1
+            response_token_lens['format_1_answer_0'] += len(output.outputs[0].token_ids)
+            response_char_lens['format_1_answer_0'] += len(generated_text)
         elif format_reward == 0 and answer_reward == 0:
             categories['format_0_answer_0'] += 1
+            response_token_lens['format_0_answer_0'] += len(output.outputs[0].token_ids)
+            response_char_lens['format_0_answer_0'] += len(generated_text)
 
         accuracy['total_accuracy'] += reward['reward'] / num_prompts
         accuracy['format_accuracy'] += reward['format_reward'] / num_prompts
@@ -120,6 +146,8 @@ def evaluate_vllm(vllm_model, reward_fn, prompts, responses, answers, eval_sampl
     results['eval_metrics_nums'] = categories
     results['eval_metrics_ratios'] = categories_ratios
     results['accuracy'] = accuracy
+    results['response_token_lens'] = calculate_average(num_prompts, response_token_lens, categories)
+    results['response_char_lens'] = calculate_average(num_prompts, response_char_lens, categories)
 
     if save_results:
         with open(serialize_path, 'w', encoding='utf-8') as f:
@@ -129,6 +157,8 @@ def evaluate_vllm(vllm_model, reward_fn, prompts, responses, answers, eval_sampl
     print(f'categories is {categories}')
     print(f'categories_ratios is {categories_ratios}')
     print(f'accuracy is {accuracy}')
+    print(f'response_token_lens is {results["response_token_lens"]}')
+    print(f'response_char_lens is {results["response_char_lens"]}')
 
     return results
 
@@ -146,7 +176,7 @@ def math_baseline():
 
     prompts, responses, answers = load_cot_prompt(valid_data)
 
-    _ = evaluate_vllm(llm, r1_zero_reward_fn, prompts, responses, answers, sampling_params, serialize_path, True)
+    _ = evaluate_vllm(llm, r1_zero_reward_fn, prompts, responses, answers, sampling_params, serialize_path, False)
 
 
 if __name__ == "__main__":
